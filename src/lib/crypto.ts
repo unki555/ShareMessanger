@@ -1,18 +1,16 @@
 /**
- * Клиентское шифрование сообщений (AES-256-GCM + PBKDF2).
- * В Supabase уходит только ciphertext + iv — plaintext на сервере не хранится.
- *
- * Важно: pepper в клиенте извлекаем. Это защита от утечки БД / логов,
- * не полный Signal-протокол. Для production E2E — отдельные identity keys.
+ * AES-256-GCM + кеш ключей.
+ * При ошибке расшифровки возвращаем null — UI не спамит «не удалось».
  */
 
 const APP_PEPPER = "share-v1-pepper-change-in-prod-9f3a2c";
-const PBKDF2_ITERATIONS = 210_000;
+const PBKDF2_ITERATIONS = 100_000;
+const keyCache = new Map<string, CryptoKey>();
 
 function b64encode(buf: ArrayBuffer | Uint8Array): string {
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   let s = "";
-  bytes.forEach((b) => (s += String.fromCharCode(b)));
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
   return btoa(s);
 }
 
@@ -23,11 +21,14 @@ function b64decode(s: string): Uint8Array {
   return out;
 }
 
-async function deriveChatKey(
-  userA: string,
-  userB: string,
-): Promise<CryptoKey> {
-  const pair = [userA.toLowerCase(), userB.toLowerCase()].sort().join("|");
+function pairKey(a: string, b: string) {
+  return [a.toLowerCase(), b.toLowerCase()].sort().join("|");
+}
+
+async function deriveChatKey(userA: string, userB: string): Promise<CryptoKey> {
+  const pair = pairKey(userA, userB);
+  const hit = keyCache.get(pair);
+  if (hit) return hit;
   const material = `${APP_PEPPER}|chat|${pair}`;
   const enc = new TextEncoder();
   const baseKey = await crypto.subtle.importKey(
@@ -37,11 +38,10 @@ async function deriveChatKey(
     false,
     ["deriveKey"],
   );
-  const salt = enc.encode(`salt|${pair}|share`);
-  return crypto.subtle.deriveKey(
+  const key = await crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
-      salt,
+      salt: enc.encode(`salt|${pair}|share`),
       iterations: PBKDF2_ITERATIONS,
       hash: "SHA-256",
     },
@@ -50,12 +50,15 @@ async function deriveChatKey(
     false,
     ["encrypt", "decrypt"],
   );
+  keyCache.set(pair, key);
+  return key;
 }
 
-export type EncryptedPayload = {
-  ciphertext: string;
-  iv: string;
-};
+export function clearCryptoCache() {
+  keyCache.clear();
+}
+
+export type EncryptedPayload = { ciphertext: string; iv: string };
 
 export async function encryptText(
   plain: string,
@@ -77,8 +80,9 @@ export async function decryptText(
   iv: string,
   myUsername: string,
   peerUsername: string,
-): Promise<string> {
+): Promise<string | null> {
   try {
+    if (!ciphertext || !iv) return null;
     const key = await deriveChatKey(myUsername, peerUsername);
     const pt = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: b64decode(iv) },
@@ -87,16 +91,15 @@ export async function decryptText(
     );
     return new TextDecoder().decode(pt);
   } catch {
-    return "[не удалось расшифровать]";
+    return null;
   }
 }
 
-/** Шифруем data-URL картинки целиком (для небольших фото). */
 export async function encryptImageDataUrl(
   dataUrl: string,
   myUsername: string,
   peerUsername: string,
-): Promise<EncryptedPayload> {
+) {
   return encryptText(dataUrl, myUsername, peerUsername);
 }
 
@@ -105,6 +108,6 @@ export async function decryptImageDataUrl(
   iv: string,
   myUsername: string,
   peerUsername: string,
-): Promise<string> {
+) {
   return decryptText(ciphertext, iv, myUsername, peerUsername);
 }
